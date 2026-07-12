@@ -6,7 +6,7 @@ Scope:
 - Model alias: `Qwen3.6-35B-A3B-Abliterated-Heretic-oQ8-fp16`
 - Source: `Youssofal/Qwen3.6-35B-A3B-Abliterated-Heretic-BF16` on Hugging Face
 - Quant: oQ+ at oQ8 (vision encoder kept at fp16, language stack at ~8.6 bpw)
-- Context: YaRN 2× → 524288 tokens
+- Context: YaRN 2× → 524288 tokens (factor is configurable; 2.0 is the safe default)
 - Sampling: Qwen's "thinking, precise coding/WebDev" recipe
 - Thinking: native adaptive, no hard cap; `preserve_thinking=true`
 - API: Anthropic cache-hit accounting patched into oMLX (see §5)
@@ -45,35 +45,50 @@ Expected output size: ~38–40 GB across 8 shards.
 
 With the fix in `omlx/oq.py` (see §7(c)), fresh oQ runs on Qwen3.6 HF BF16 write tensor keys with the correct `vision_tower.*` naming from the start. No rename step is needed, and the checkpoint loads cleanly as a VLM via `mlx-vlm`. If you're porting an oQ checkpoint that was **built before the oq.py fix**, see §7(d) for the one-time in-place tensor rename.
 
-## 4. Apply YaRN 2× to `config.json`
+## 4. Apply YaRN context extension
+
+oMLX now auto-detects YaRN when `rope_parameters.type` (or `rope_type`) is set to `"yarn"` in the model's `config.json`. The runtime patch (`omlx/patches/qwen35_yarn_rope.py`) applies the YaRN frequency interpolation/extrapolation blend to `MRoPERotaryEmbedding._inv_freq` at model load time. This works for both Qwen3.5 and Qwen3.6 (MoE) VLMs.
+
+### Option A: Edit `config.json` (recommended for reproducibility)
 
 **File**: `<model-dir>/Qwen3.6-35B-A3B-Abliterated-Heretic-oQ8-fp16/config.json`
 
 Patch `text_config.rope_parameters` and `text_config.max_position_embeddings`. Reproducible script:
 
 ```python
-# apply_yarn.py
+# apply_yarn.py — factor is configurable (2.0, 3.0, 4.0, etc.)
 import json
 from pathlib import Path
 
 MODEL_DIR = Path.home() / "models" / "Qwen3.6-35B-A3B-Abliterated-Heretic-oQ8-fp16"
+FACTOR = 2.0  # 2.0 → 524K, 3.0 → 786K, 4.0 → 1M
+ORIG_MAX_POS = 262144
+
 p = MODEL_DIR / "config.json"
 c = json.loads(p.read_text())
-c["text_config"]["max_position_embeddings"] = 524288
+c["text_config"]["max_position_embeddings"] = int(ORIG_MAX_POS * FACTOR)
 c["text_config"]["rope_parameters"] = {
     "mrope_interleaved": True,
     "mrope_section": [11, 11, 10],
     "rope_type": "yarn",
     "rope_theta": 10000000,
     "partial_rotary_factor": 0.25,
-    "factor": 2.0,
-    "original_max_position_embeddings": 262144,
+    "factor": FACTOR,
+    "original_max_position_embeddings": ORIG_MAX_POS,
 }
 p.write_text(json.dumps(c, indent=2, ensure_ascii=False))
-print("YaRN 2× applied")
+print(f"YaRN {FACTOR}× applied → {int(ORIG_MAX_POS * FACTOR)} tokens")
 ```
 
-Factor choice: 2.0 is the safe default for interleaved-MRoPE. Bump to 3.0 → ~786K or 4.0 → ~1M only if the workload demands it and after testing long-context quality. Static YaRN degrades short-input quality, so enable only when >262K context is actually needed.
+### Option B: Enable via admin UI (no config edit needed)
+
+Open the admin dashboard → Model Settings for a Qwen 3.5/3.6 VLM → toggle **YaRN RoPE Scaling** and set the desired factor. The UI toggle force-enables YaRN even when `config.json` doesn't declare it. Set `max_context_window` to `original × factor` (e.g. 524288 for 2×).
+
+The corresponding `model_settings.json` fields are `yarn_enabled: true` and `yarn_factor: 2.0`.
+
+### Factor choice
+
+2.0 is the safe default for interleaved-MRoPE. Bump to 3.0 → ~786K or 4.0 → ~1M only if the workload demands it and after testing long-context quality. Static YaRN degrades short-input quality, so enable only when >262K context is actually needed.
 
 ## 5. oMLX per-model settings — `~/.omlx/model_settings.json`
 
@@ -88,6 +103,8 @@ Merge (or create) this entry under `models`:
     "Qwen3.6-35B-A3B-Abliterated-Heretic-oQ8-fp16": {
       "force_sampling": false,
       "thinking_budget_enabled": false,
+      "yarn_enabled": null,
+      "yarn_factor": null,
       "turboquant_kv_enabled": false,
       "turboquant_kv_bits": 4.0,
       "turboquant_skip_last": true,
@@ -114,7 +131,8 @@ Merge (or create) this entry under `models`:
 
 Rationale for each field:
 - Sampling set (temperature 0.6 etc.) — Qwen's official **thinking + precise coding/WebDev** recipe. For general thinking, swap to `temperature=1.0, presence_penalty=1.5`. For non-thinking, swap to `temperature=0.7, top_p=0.8, presence_penalty=1.5` and set `enable_thinking=false`.
-- `max_context_window=524288` — matches the YaRN 2× scaled context.
+- `yarn_enabled=null` / `yarn_factor=null` — auto-detect from `config.json`. Set `yarn_enabled=true` + `yarn_factor=2.0` (or another value) to force YaRN without editing config.json. See §4.
+- `max_context_window=524288` — matches the YaRN 2× scaled context. Adjust to `original × factor` when using a different factor.
 - `max_tokens=81920` — Qwen's own reference for heavy reasoning / agentic coding. Drop to 32768 for lighter chat use.
 - `chat_template_kwargs.preserve_thinking=true` — new in Qwen3.6, keeps prior turns' `<think>` blocks so multi-turn agent loops don't re-reason from scratch.
 - `chat_template_kwargs.enable_thinking=true` — explicit; Qwen3.6 defaults to thinking but setting it explicit survives future template changes.
@@ -258,13 +276,14 @@ The SSD cold tier matters a lot for Claude Code workloads — the large system-p
 3. **CTX window shows 524288**: admin → Model Settings → Load Defaults.
 4. **Sampling overrides show**: admin → Model Settings → fields populated with 0.6 / 0.95 / 20 / 0 / 0 / 1.0.
 5. **Vision works end-to-end**: send a multimodal request with a small image; response references image content.
-6. **YaRN scaling is live**: send a prompt longer than 262144 tokens; server accepts without truncation up to 524288.
+6. **YaRN scaling is live**: server log shows `YaRN RoPE patch active for … (factor=2.00, orig_max_pos=262144)` at model load. Send a prompt longer than 262144 tokens; server accepts without truncation up to 524288.
 7. **Prefix cache hits register in Anthropic usage**: send two identical long prompts in a row; the second response's `usage.cache_read_input_tokens` is > 0.
 8. **`preserve_thinking` carries forward**: in a multi-turn conversation, inspect the rendered prompt and confirm prior `<think>` blocks are included.
 
 ## 10. Known tradeoffs
 
-- **Static YaRN tax**: every request (including short ones) goes through 2× scaled RoPE. If a mixed workload is painful, run a second model-settings profile without YaRN and route short requests there.
+- **Static YaRN tax**: every request (including short ones) goes through scaled RoPE. If a mixed workload is painful, run a second model-settings profile without YaRN and route short requests there.
+- **mscale limitation**: the YaRN attention amplitude correction (`mscale`) is applied via `attention_scaling` on the slow Python path but bypassed by the fused Metal `apply_rotary` kernel. For typical factors (2–4×) mscale is ≈1.07–1.14, so the impact is minor.
 - **`preserve_thinking` grows context**: `<think>` blocks accumulate across turns. Watch RAM in long agent loops; YaRN 2× + long thinking can fill the KV budget.
 - **`cache_creation_input_tokens` is always 0 in responses**: oMLX doesn't distinguish creation from read (see §6). Claude Code's cost arithmetic still reconciles, but don't interpret the 0 as "no cache write" — it just means we don't track that axis.
 - **Upstream mlx-vlm patch is pending** (see §7): until the `elif → if` fix lands upstream and this fork bumps its pin, the local sanitize wrapper is mandatory for Qwen3.6 VLM loading. Our patch is guarded and self-deactivates once upstream ships it.
